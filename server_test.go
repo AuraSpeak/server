@@ -22,10 +22,9 @@ func TestNewServer_WithConfig(t *testing.T) {
 
 	require.NotNil(t, srv)
 	assert.Equal(t, 8080, srv.Port)
-	assert.NotNil(t, srv.dtlsConfig)
-	assert.NotNil(t, srv.packetRouter)
-	assert.NotNil(t, srv.nm)
+	assert.NotNil(t, srv.ns)
 	assert.NotNil(t, srv.OutCommandCh)
+	assert.NotNil(t, srv.TraceCh)
 }
 
 func TestNewServer_NilConfig(t *testing.T) {
@@ -34,8 +33,7 @@ func TestNewServer_NilConfig(t *testing.T) {
 
 	require.NotNil(t, srv)
 	assert.Equal(t, 8080, srv.Port)
-	assert.NotNil(t, srv.dtlsConfig)
-	// With nil Config, default dev/self_signed should be used
+	assert.NotNil(t, srv.ns)
 }
 
 func TestNewServer_DTLSConfigError(t *testing.T) {
@@ -89,7 +87,7 @@ func TestOnPacket(t *testing.T) {
 		Payload:      []byte("test"),
 	}
 
-	err := srv.packetRouter.HandlePacket(packet, "127.0.0.1:8080")
+	err := srv.ns.HandlePacketForTest(packet, "127.0.0.1:8080")
 	assert.NoError(t, err)
 	assert.True(t, handlerCalled)
 }
@@ -164,7 +162,7 @@ func TestStop(t *testing.T) {
 	assert.True(t, srv.ShouldStop)
 }
 
-func TestStop_NilListener(t *testing.T) {
+func TestStop_NoListener(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Server.Env = "dev"
 	cfg.Server.DTLS.Certs.Mode = "self_signed"
@@ -174,9 +172,7 @@ func TestStop_NilListener(t *testing.T) {
 	srv := NewServer(0, ctx, cfg)
 	require.NotNil(t, srv)
 
-	srv.ln = nil
-
-	// Stop should not crash
+	// Stop on non-running server should not crash
 	srv.Stop()
 }
 

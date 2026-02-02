@@ -1,44 +1,34 @@
-// Package server provides a DTLS-based UDP server for handling incoming connections and packets.
+// Package server provides a DTLS-based UDP server that delegates networking to github.com/auraspeak/network/server.
 package server
 
 import (
 	"context"
 	"errors"
-	"net"
 	"sync/atomic"
-	"time"
 
+	netserver "github.com/auraspeak/network/server"
 	"github.com/auraspeak/protocol"
 	"github.com/auraspeak/server/internal/config"
 	mdtls "github.com/auraspeak/server/internal/dtls"
-	"github.com/auraspeak/server/internal/node"
-	"github.com/auraspeak/server/internal/router"
 	"github.com/auraspeak/server/pkg/command"
 	"github.com/auraspeak/server/pkg/tracer"
-	"github.com/pion/dtls/v3"
 	log "github.com/sirupsen/logrus"
 )
 
-// Server represents a DTLS-based UDP server that handles incoming connections and routes packets.
+// Server is the application-layer server: it wraps the network server and adds state and commands.
 type Server struct {
-	Port int
-	ln   net.Listener
+	ns *netserver.Server
 
-	ctx context.Context
+	Port int
+	ctx  context.Context
 
 	ServerState
 
 	IsAlive    int32
 	shouldStop int32
 
-	nm *node.NodeManager
-
 	OutCommandCh chan command.InternalCommand
-
-	packetRouter *router.Router
 	TraceCh      chan tracer.TraceEvent
-
-	dtlsConfig *dtls.Config
 
 	srvConfig *config.Config
 }
@@ -53,13 +43,6 @@ type ServerState struct {
 // NewServer creates a new Server. cfg may be nil; then a minimal dev/self_signed config is used.
 // Returns nil if DTLS config cannot be built.
 func NewServer(port int, ctx context.Context, cfg *config.Config) *Server {
-	srv := &Server{
-		Port:         port,
-		OutCommandCh: make(chan command.InternalCommand, 10),
-		ctx:          ctx,
-		packetRouter: router.NewRouter(),
-	}
-
 	dcfg := cfg
 	if dcfg == nil {
 		dcfg = &config.Config{}
@@ -67,7 +50,6 @@ func NewServer(port int, ctx context.Context, cfg *config.Config) *Server {
 		dcfg.Server.DTLS.Certs.Mode = "self_signed"
 	}
 
-	// For mode=files: generate Cert/Key/CA if needed (GenerateCertificates is a no-op if all exist).
 	mode := dcfg.Server.DTLS.Certs.Mode
 	if mode == "" {
 		if dcfg.Server.Env == "dev" {
@@ -76,7 +58,6 @@ func NewServer(port int, ctx context.Context, cfg *config.Config) *Server {
 			mode = "files"
 		}
 	}
-	// If mode is file and env is dev, generate certificates
 	if mode == "files" && dcfg.Server.Env == "dev" {
 		if err := config.GenerateCertificates(dcfg); err != nil {
 			log.WithField("caller", "server").WithError(err).Error("Failed to generate DTLS certificates")
@@ -84,129 +65,105 @@ func NewServer(port int, ctx context.Context, cfg *config.Config) *Server {
 		}
 	}
 
-	var err error
-	srv.dtlsConfig, err = mdtls.NewDTLSConfig(dcfg)
+	dtlsConfig, err := mdtls.NewDTLSConfig(dcfg)
 	if err != nil {
 		log.WithField("caller", "server").WithError(err).Error("Failed to create DTLS config")
 		return nil
 	}
-	srv.srvConfig = dcfg
 
-	srv.OnPacket(protocol.PacketTypeDebugHello, handleDebugHello)
-	srv.TraceCh = make(chan tracer.TraceEvent, 2000)
-	srv.nm = node.NewNodeManager(8192, srv.packetRouter, srv.TraceCh)
+	traceCh := make(chan tracer.TraceEvent, 2000)
+	traceFunc := func(local, remote, dir string, payload []byte) {
+		var d tracer.TraceDirection
+		if dir == "in" {
+			d = tracer.TraceIn
+		} else {
+			d = tracer.TraceOut
+		}
+		ev := tracer.NewTraceEvent(d, local, remote, len(payload), payload, 0)
+		select {
+		case traceCh <- ev:
+		default:
+		}
+	}
+
+	cfgNet := netserver.ServerConfig{
+		Port:        port,
+		DTLSConfig:  dtlsConfig,
+		ConnBufSize: 8192,
+		TraceFunc:   traceFunc,
+	}
+	ns := netserver.NewServer(cfgNet)
+
+	srv := &Server{
+		ns:           ns,
+		Port:         port,
+		ctx:          ctx,
+		OutCommandCh: make(chan command.InternalCommand, 10),
+		TraceCh:      traceCh,
+		srvConfig:    dcfg,
+	}
+	ns.OnPacket(protocol.PacketTypeDebugHello, func(packet *protocol.Packet, peer string) error {
+		return handleDebugHello(packet, peer)
+	})
 	return srv
 }
 
-// OnPacket registers a new PacketHandler for a specific packet type
-//
-// Example:
-//
-//	server.OnPacket(protocol.PacketTypeDebugHello, func(packet *protocol.Packet, clientAddr string) error {
-//		fmt.Println("Received text packet:", string(packet))
-//		return nil
-//	})
-func (s *Server) OnPacket(packetType protocol.PacketType, handler router.PacketHandler) {
+// PacketHandler is the application-layer handler type (peer is client address).
+type PacketHandler func(packet *protocol.Packet, clientAddr string) error
+
+// OnPacket registers a handler for a packet type.
+func (s *Server) OnPacket(packetType protocol.PacketType, handler PacketHandler) {
 	log.WithField("caller", "server").Debugf("Registering packet handler for packet type: %s", protocol.PacketTypeMapType[packetType])
-	s.packetRouter.OnPacket(packetType, handler)
+	s.ns.OnPacket(packetType, func(packet *protocol.Packet, peer string) error {
+		return handler(packet, peer)
+	})
 }
 
-// Run starts the Server and listens for incoming DTLS connections
+// Run starts the server and listens for incoming DTLS connections.
 func (s *Server) Run() error {
-	s.packetRouter.ListRoutes()
 	if atomic.LoadInt32(&s.IsAlive) == 1 {
 		return errors.New("server is already running")
 	}
-	addr := &net.UDPAddr{
-		IP:   net.IPv4(0, 0, 0, 0),
-		Port: s.Port,
-	}
-	var err error
-	s.ln, err = dtls.Listen("udp", addr, s.dtlsConfig)
-	if err != nil {
-		return err
-	}
-	defer s.ln.Close()
 	s.setIsAlive(true)
-	log.WithField("caller", "server").Infof("Server started on port %d", s.Port)
-
-	for {
-		select {
-		case <-s.ctx.Done():
-			return nil
-		case <-s.OutCommandCh:
-		default:
-		}
-		shouldStop := atomic.LoadInt32(&s.shouldStop) == 1
-		if shouldStop {
-			break
-		}
-		conn, err := s.ln.Accept()
-		if err != nil {
-			log.WithField("caller", "server").WithError(err).Error("Accept Error")
-			conn.Close()
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		dtlsConn, ok := conn.(*dtls.Conn)
-		if ok {
-			err = dtlsConn.HandshakeContext(ctx)
-		}
-		if !ok {
-			log.WithField("caller", "server").Error("Accept Error: Connection is not a DTLS connection")
-			conn.Close()
-		}
-		cancel()
-		if err == nil {
-			s.nm.RegisterConn(conn)
-		}
-	}
-	s.setIsAlive(false)
-	return nil
+	defer s.setIsAlive(false)
+	return s.ns.Run(s.ctx)
 }
 
-// Stop stops the Server and closes all connections
+// Stop stops the server and closes all connections.
 func (s *Server) Stop() {
 	s.setShouldStop()
-
-	if s.ln != nil {
-		_ = s.ln.Close()
-		s.ln = nil
-	}
-	s.nm.SendStop()
-	s.nm.DisconnectAll()
+	s.ns.Stop()
 }
 
 // Broadcast sends a packet to all connected clients.
 func (s *Server) Broadcast(packet *protocol.Packet) {
-	s.nm.Broadcast(packet)
+	s.ns.Broadcast(packet)
 }
 
-// setShouldStop marks the server for shutdown and notifies the state update channel.
 func (s *Server) setShouldStop() {
 	atomic.StoreInt32(&s.shouldStop, 1)
+	s.updated = true
+	s.ShouldStop = true
 	select {
 	case <-s.ctx.Done():
 		return
 	case s.OutCommandCh <- command.CmdUpdateServerState:
 	default:
 	}
-	s.updated = true
-	s.ShouldStop = true
 }
 
-// setIsAlive updates the server's alive status and notifies the state update channel.
 func (s *Server) setIsAlive(val bool) {
 	var v int32
 	if val {
 		v = 1
 	}
 	atomic.StoreInt32(&s.IsAlive, v)
+	s.updated = true
+	s.ServerState.IsAlive = val
 	select {
 	case <-s.ctx.Done():
 		return
 	case s.OutCommandCh <- command.CmdUpdateServerState:
 	default:
 	}
-	s.updated = true
-	s.ServerState.IsAlive = val
 }
