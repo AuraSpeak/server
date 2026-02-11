@@ -5,7 +5,7 @@ go 1.25.1
 require (
 	github.com/auraspeak/network v0.0.0-pre0.1
 	github.com/auraspeak/protocol v0.0.0-pre0.1
-	github.com/pion/dtls/v3 v3.0.10
+	github.com/pion/dtls/v3 v3.1.0
 	github.com/sirupsen/logrus v1.9.4
 	gopkg.in/yaml.v2 v2.4.0
 )
